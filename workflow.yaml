@@ -1,0 +1,134 @@
+name: Build NetHunter Kernel for LG K10 (m216)
+
+on:
+  push:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 1 * *'
+
+jobs:
+  build:
+    runs-on: ubuntu-20.04
+    
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential bc flex bison curl ccache git wget xz-utils patch libncurses5 libncurses5-dev
+
+      - name: Clone kernel source
+        run: |
+          git clone --depth=1 https://github.com/LineageOS/android_kernel_lge_msm8916.git -b cm-14.1 kernel
+
+      - name: Clone NetHunter builder (for patches)
+        run: |
+          cd kernel
+          git clone --depth=1 https://gitlab.com/kalilinux/nethunter/build-scripts/kali-nethunter-kernel-builder.git
+
+      - name: Download GCC toolchain
+        run: |
+          mkdir -p ~/nethunter_tools
+          cd ~/nethunter_tools
+          # Linaro GCC 4.9.4 from releases.linaro.org (still online)
+          wget -q https://releases.linaro.org/components/toolchain/binaries/4.9-2017.01/arm-linux-gnueabihf/gcc-linaro-4.9.4-2017.01-x86_64_arm-linux-gnueabihf.tar.xz
+          tar xf gcc-linaro-4.9.4-2017.01-x86_64_arm-linux-gnueabihf.tar.xz
+          mv gcc-linaro-4.9.4-2017.01-x86_64_arm-linux-gnueabihf arm-linux-androideabi-4.9
+          rm gcc-linaro-4.9.4-2017.01-x86_64_arm-linux-gnueabihf.tar.xz
+          # Create symlinks with android naming convention
+          cd arm-linux-androideabi-4.9/bin
+          for f in arm-linux-gnueabihf-*; do
+            newname=$(echo "$f" | sed 's/arm-linux-gnueabihf/arm-linux-androideabi/')
+            ln -s "$f" "$newname"
+          done
+
+      - name: Fix yylloc
+        working-directory: kernel
+        run: |
+          sed -i 's/YYLTYPE yylloc;/extern YYLTYPE yylloc;/' scripts/dtc/dtc-lexer.lex.c_shipped
+          rm -f scripts/dtc/dtc-lexer.lex.c
+
+      - name: Fix Python 2 prints
+        working-directory: kernel
+        run: |
+          sed -i 's/print "error, forbidden warning:", m.group(2)/print("error, forbidden warning:", m.group(2))/' scripts/gcc-wrapper.py
+          sed -i 's/print line,/print(line, end="")/' scripts/gcc-wrapper.py
+          sed -i "s/print ' '.join(args), str(e)/print(' '.join(args), str(e))/" scripts/gcc-wrapper.py
+          sed -i "s/print 'Is your PATH set correctly?'/print('Is your PATH set correctly?')/" scripts/gcc-wrapper.py
+
+      - name: Fix kernelrelease
+        working-directory: kernel
+        run: |
+          sed -i 's|echo "Error: kernelrelease not valid.*|echo "3.10.49-NetHunter"|' scripts/setlocalversion
+          sed -i 's|exit 1|exit 0|' scripts/setlocalversion
+
+      - name: Fix Makefile
+        working-directory: kernel
+        run: |
+          sed -i 's|CC.*scripts/gcc-wrapper.py.*|CC = $(REAL_CC)|' Makefile
+          sed -i 's|REAL_CC.*=.*|REAL_CC = $(CROSS_COMPILE)gcc|' Makefile
+
+      - name: Apply NetHunter patches
+        working-directory: kernel
+        run: |
+          PATCHES=kali-nethunter-kernel-builder/patches/3.10
+
+          # HID MSM8916
+          if [ -f "$PATCHES/add-HID-km-support-motorola__msm8916_____3.10.patch" ]; then
+            patch -p1 < "$PATCHES/add-HID-km-support-motorola__msm8916_____3.10.patch" || true
+            if [ -f drivers/usb/gadget/android.c.rej ]; then
+              sed -i '3249a\\nstatic int hid_function_init(struct android_usb_function *f, struct usb_composite_dev *cdev)\n{\n\treturn ghid_setup(cdev->gadget, 2);\n}\n\nstatic void hid_function_cleanup(struct android_usb_function *f)\n{\n\tghid_cleanup();\n}\n\nstatic int hid_function_bind_config(struct android_usb_function *f, struct usb_configuration *c)\n{\n\tint ret;\n\tprintk(KERN_INFO "hid keyboard\\n");\n\tret = hidg_bind_config(c, &ghid_device_android_keyboard, 0);\n\tif (ret) {\n\t\tpr_info("%s: hid_function_bind_config keyboard failed: %d\\n", __func__, ret);\n\t\treturn ret;\n\t}\n\tprintk(KERN_INFO "hid mouse\\n");\n\tret = hidg_bind_config(c, &ghid_device_android_mouse, 1);\n\tif (ret) {\n\t\tpr_info("%s: hid_function_bind_config mouse failed: %d\\n", __func__, ret);\n\t\treturn ret;\n\t}\n\treturn 0;\n}\n\nstatic struct android_usb_function hid_function = {\n\t.name\t\t= "hid",\n\t.init\t\t= hid_function_init,\n\t.cleanup\t= hid_function_cleanup,\n\t.bind_config\t= hid_function_bind_config,\n};' drivers/usb/gadget/android.c
+              sed -i 's/\t\&midi_function,/\t\&hid_function,\n\t\&midi_function,/' drivers/usb/gadget/android.c
+              rm -f drivers/usb/gadget/android.c.rej
+            fi
+          fi
+
+          # mac80211 injection
+          [ -f "$PATCHES/add-mac80211-packet-injection-3.10.patch" ] && patch -p1 < "$PATCHES/add-mac80211-packet-injection-3.10.patch" || true
+
+          # rtl8xxxu
+          if [ -f "$PATCHES/add-rtl8xxxu-with-rtl8188eus-drivers-3.10.patch" ]; then
+            patch -p1 < "$PATCHES/add-rtl8xxxu-with-rtl8188eus-drivers-3.10.patch" || true
+            grep -q "rtl8xxxu" drivers/net/wireless/Kconfig || echo 'source "drivers/net/wireless/rtl8xxxu/Kconfig"' >> drivers/net/wireless/Kconfig
+            grep -q "rtl8xxxu" drivers/net/wireless/Makefile || echo 'obj-$(CONFIG_RTL8XXXU) += rtl8xxxu/' >> drivers/net/wireless/Makefile
+          fi
+
+      - name: Build kernel
+        working-directory: kernel
+        run: |
+          export ARCH=arm
+          export CROSS_COMPILE=~/nethunter_tools/arm-linux-androideabi-4.9/bin/arm-linux-androideabi-
+          make m216_defconfig
+          make -j$(nproc)
+
+      - name: Upload kernel
+        uses: actions/upload-artifact@v4
+        with:
+          name: zImage-m216-NetHunter
+          path: kernel/arch/arm/boot/zImage
+
+      - name: Upload DTBs
+        uses: actions/upload-artifact@v4
+        with:
+          name: dtb-m216-NetHunter
+          path: kernel/arch/arm/boot/dts/**/*.dtb
+
+      - name: Upload modules
+        uses: actions/upload-artifact@v4
+        with:
+          name: modules-m216-NetHunter
+          path: |
+            kernel/**/*.ko
+            kernel/Module.symvers
+            kernel/System.map
+
+      - name: Upload AnyKernel3
+        uses: actions/upload-artifact@v4
+        with:
+          name: anykernel3
+          path: kernel/kali-nethunter-kernel-builder/anykernel3/
+
+      - name: Summary
+        run: |
+          echo "============================================"
+          echo "✅ NetHunter Kernel for LG K10 (m216) built!"
+          echo "============================================"
